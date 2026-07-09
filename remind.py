@@ -17,8 +17,9 @@ from zoneinfo import ZoneInfo
 # 实盘入金后改对应策略的股数; 月初rebase只上调。
 STRATS = [
     {'key': 'v6b', 'name': 'v6b 银行+中证2000 做T', 'primary': True,
-     'tleg': [('sh512800', '512800 银行ETF', 1600),
-              ('sh563300', '563300 中证2000ETF', 800)]},
+     'live_since': '2026-07-10',   # 实盘2万起跑日: 当天只建底仓不卖, 次日起进入每日做T循环
+     'tleg': [('sh512800', '512800 银行ETF', 3200),      # 2万口径: int(20000×0.5×0.5×0.49/0.761/100)×100
+              ('sh563300', '563300 中证2000ETF', 1600)]},
     {'key': 'v6', 'name': 'v6 银行+中证1000 做T', 'primary': False,
      'tleg': [('sh512800', '512800 银行ETF', 1600),
               ('sh512100', '512100 中证1000ETF', 300)]},
@@ -167,9 +168,13 @@ def main():
 
     # 总结行
     p0 = STRATS[0]
+    is_live_day = p0.get('live_since') == str(nxt)
     off0 = [n.split(' ')[0] for c, n, _ in p0['tleg'] if not gate[c][1]]
     parts = [rot_head if rot_head else '轮动无动作(三策略同)']
-    parts.append(f'⭐{p0["key"]}做T{len(p0["tleg"]) * 2}张单照常' + (f'(⛔{"/".join(off0)}暂停)' if off0 else ''))
+    if is_live_day:
+        parts.append(f'⭐{p0["key"]} **实盘建仓日: 只买底仓{len(p0["tleg"])}张单, 今天不卖**')
+    else:
+        parts.append(f'⭐{p0["key"]}做T{len(p0["tleg"]) * 2}张单照常' + (f'(⛔{"/".join(off0)}暂停)' if off0 else ''))
     if is_dca:
         parts.append('💰定投1000')
     if nxt_tday == 1:
@@ -185,7 +190,14 @@ def main():
         return rows
 
     md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略)', '']
-    md += tleg_table(p0)
+    if is_live_day:
+        md += ['**今天是实盘建仓日**: 只买入底仓, **不设卖单**; 每日做T循环(9:15买批次+14:58卖批次)从下一交易日开始。', '',
+               '| 标的 | 底仓数量 | 委托 |', '| --- | --- | --- |']
+        for code, name_, lot in p0['tleg']:
+            md.append(f'| {name_} | **{lot}股** | 定时条件单 9:15 @涨停价(集合竞价按开盘价成交) |')
+        md += ['', '其余资金(轮动份额49%+缓冲)留现金, 建议做**通用回购/逆回购**停车; 轮动腿建仓等调仓日信号, 勿手动抢跑。']
+    else:
+        md += tleg_table(p0)
     md += ['', '## 二、轮动腿(三策略共用同一信号)', '']
     if rot_head:
         md.append(f'1. {rot_head}')
