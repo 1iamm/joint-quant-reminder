@@ -14,8 +14,8 @@ FEE = 1.0              # bp 单边
 CASH_DAILY = 0.015 / 243
 PREM_TH = 0.08
 
-def build_heti():
-    K = {c: fetch_qfq(c, 900) for c in set(ROT) | set(TLEG)}
+def build_strategy(title, W):
+    K = {c: fetch_qfq(c, 900) for c in set(ROT) | set(W)}
     OC = {c: {d: (o, cl) for d, o, cl in K[c]} for c in K}
 
     # --- 轮动腿(双份1/11, L15, 纳/金/债/现金) ---
@@ -62,27 +62,26 @@ def build_heti():
         for s in ROT: hist[s].append(OC[s][d][1])
 
     # --- 做T腿(500/银/2000, 250日隔夜闸门月度更新) ---
-    tdays = sorted(set(OC['sh510500']) | set(OC['sh512800']) | set(OC['sh563300']))
+    tdays = sorted(set.union(*[set(OC[s]) for s in W]))
     TRm = {}
-    for s in TLEG:
+    for s in W:
         TRm[s] = {}; pc = None
         for d in sorted(OC[s]):
             o, c = OC[s][d]
             if pc: TRm[s][d] = (o / pc - 1, c / o - 1, c / pc - 1)
             pc = c
-    W = {'sh510500': 0.5, 'sh512800': 0.3, 'sh563300': 0.2}
-    hov = {s: [] for s in TLEG}
-    act = {s: True for s in TLEG}
+    hov = {s: [] for s in W}
+    act = {s: True for s in W}
     lastm = None
     t_ret = {}
     for d in tdays:
         if d[:7] != lastm:
             lastm = d[:7]
-            for s in TLEG:
+            for s in W:
                 if len(hov[s]) >= 250:
                     act[s] = sum(hov[s][-250:]) / 250 * 1e4 < -2.0
         day = 0.0
-        for s in TLEG:
+        for s in W:
             if d not in TRm[s]: continue
             ov, it, tot = TRm[s][d]
             day += W[s] * (((1 + 0.5 * ov) * (1 + it) * (1 - 0.5 * FEE / 1e4) - 1) if act[s] else 0.5 * tot)
@@ -107,9 +106,9 @@ def build_heti():
     nav = fetch_nav_513100()
     px = fetch_raw_price('sh513100') or OC['sh513100'][rdays[-1]][1]
     prem = (px / nav[1] - 1) if nav else None
-    gate = {s: act[s] for s in TLEG}
+    gate = {s: act[s] for s in W}
     return {
-        'name': '合体v5.1 (做T+纳金债现轮动+溢价闸)',
+        'name': title,
         'asof': rdays[-1], 'ann': ann, 'mdd': mdd, 'cum': curve[-1] if curve else 1,
         'dates': days, 'curve': curve, 'events': events[-30:],
         'state': {
@@ -120,7 +119,11 @@ def build_heti():
         },
     }
 
-STRATEGIES = [build_heti]   # 以后加策略: 写一个 build_xxx() 返回同构 dict, append 到这里
+STRATEGIES = [   # 以后加策略: 加一个 lambda 即可
+    lambda: build_strategy('⭐ v6b 银行+中证2000做T + 纳金债现轮动 (实操)', {'sh512800': 0.5, 'sh563300': 0.5}),
+    lambda: build_strategy('v6 银行+中证1000做T + 纳金债现轮动', {'sh512800': 0.5, 'sh512100': 0.5}),
+    lambda: build_strategy('v5.1 中证500+银行+2000做T + 纳金债现轮动', {'sh510500': 0.5, 'sh512800': 0.3, 'sh563300': 0.2}),
+]
 
 HTML = '''<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
