@@ -99,7 +99,7 @@ def build_strategy(title, W):
     ann = curve[-1] ** (243 / len(days)) - 1 if days else 0
 
     # --- 当前状态 ---
-    hold2, last_reb, _ = replay_rotation({s: {d: OC[s][d][1] for d in rdays} for s in ROT}, rdays)
+    hold2, last_reb, _, _ = replay_rotation({s: {d: OC[s][d][1] for d in rdays} for s in ROT}, rdays)
     sc = {s: OC[s][rdays[-1]][1] / OC[s][rdays[-L]][1] - 1 for s in ROT}
     sc['CASH'] = CASH_SCORE
     rank = sorted(sc, key=sc.get, reverse=True)
