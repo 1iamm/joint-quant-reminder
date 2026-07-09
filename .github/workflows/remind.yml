@@ -1,0 +1,32 @@
+name: heti-reminder
+on:
+  schedule:
+    # 北京时间周日~周四晚 20:37 (UTC 12:37), 提醒下一交易日的操作
+    - cron: '37 12 * * 0,1,2,3,4'
+  workflow_dispatch: {}   # 手动触发入口, 用于测试
+
+permissions:
+  contents: write   # 仅用于 keepalive 空提交
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: run reminder
+        env:
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+        run: python remind.py
+      - name: build dashboard
+        run: python dashboard.py
+      - name: commit dashboard (每日提交顺带保持仓库活跃, 定时任务不会被停用)
+        run: |
+          git config user.name  "dashboard-bot"
+          git config user.email "actions@github.com"
+          git add docs
+          git commit -m "dashboard $(date -u +%F)" || echo "no changes"
+          git push || true
