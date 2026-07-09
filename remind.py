@@ -137,9 +137,12 @@ def main():
         m = sum(ov[-250:]) / min(250, len(ov)) * 1e4
         gate.append((code, m, m < -2.0))
 
-    # ---- 组装消息 ----
-    lines = [f'📅 下一交易日: {nxt}(当月第{nxt_tday}个交易日)', '']
-    # 轮动
+    # ---- 组装消息(Markdown, Server酱详情页渲染; 表格前后需空行) ----
+    off = [c for c, m, a in gate if not a]
+    is_dca = nxt.weekday() == 2
+
+    # 轮动动作判定
+    rot_head, rot_steps = None, []
     if nxt_tday in (1, 11):
         leg = 0 if nxt_tday == 1 else 1
         cur = hold[leg]
@@ -147,39 +150,63 @@ def main():
         if prem_block and 'sh513100' in sc2:
             del sc2['sh513100']
         best = max(sc2, key=sc2.get)
-        lines.append(f'🔄 明天是调仓日! 第{leg + 1}份轮动仓位(当前持有 {NAME.get(cur, "空")}):')
         if best == cur:
-            lines.append(f'→ 信号={NAME[best]}, 与当前一致, **不动**')
+            rot_head = f'调仓日, 但第{leg + 1}份信号与持仓一致({NAME.get(cur, "?").split(" ")[0]}), **不动**'
         else:
+            rot_head = (f'🔄 **第{leg + 1}份换仓: {NAME.get(cur, "空仓").split(" ")[0]} → '
+                        f'{NAME[best].split(" ")[0]}**')
             if cur not in (None, 'CASH'):
-                lines.append(f'→ 卖出 {NAME[cur]}: 定时条件单 9:15 @跌停价(开盘价成交)')
+                rot_steps.append(f'**9:15** 卖出 {NAME[cur]} 全部持仓, 委托=**跌停价**(集合竞价按开盘价成交)')
             if best != 'CASH':
-                lines.append(f'→ 买入 {NAME[best]}: 定时条件单 9:31 @五档价, 数量=可用资金÷现价 取整百')
+                rot_steps.append(f'**9:31** 买入 {NAME[best]}, 委托=**五档价**, 数量=可用资金÷现价 取整百')
             else:
-                lines.append('→ 转现金: 卖出后资金做逆回购/通用回购')
-    else:
-        nd11 = 11 - nxt_tday if nxt_tday < 11 else None
-        eta = f'约{nd11}个交易日后到第11交易日调仓' if nd11 else '下月第1交易日调仓'
-        lines.append(f'🔄 轮动: 明天不是调仓日({eta}), 无动作')
-    lines.append('当前应持仓: 第1份=' + NAME.get(hold[0], '?') + f'({last_reb[0]}起) 第2份=' +
-                 NAME.get(hold[1], '?') + f'({last_reb[1]}起)')
-    lines.append('L15动量榜: ' + ' > '.join(f'{NAME[s].split(" ")[0]}{sc[s]:+.1%}' for s in rank))
-    lines.append(prem_line)
-    lines.append('')
-    # 做T
-    off = [c for c, m, a in gate if not a]
-    lines.append('🔁 做T条件单核对(每天): 9:15买@涨停价 + 14:58卖@跌停价, 各标的数量:')
-    for name_, lot in LOTS.items():
-        flag = ' ⛔闸门关闭,本月暂停做T,只留底仓' if any(name_.startswith(c[2:]) for c in off) else ''
-        lines.append(f'  {name_}: {lot}股{flag}')
-    lines.append('闸门(250日隔夜bp): ' + ' '.join(f'{c[2:]}{m:+.1f}' for c, m, a in gate))
-    lines.append('')
-    if nxt.weekday() == 2:
-        lines.append('💰 明天周三: 定投转入 1000 元')
+                rot_steps.append('卖出后资金停车: **通用回购/逆回购**')
+
+    # 总结行
+    parts = [rot_head if rot_head else '轮动无动作']
+    parts.append('做T六张单照常' + (f'(⛔{len(off)}只暂停)' if off else ''))
+    if is_dca:
+        parts.append('💰定投1000')
     if nxt_tday == 1:
-        lines.append('🗓️ 明天月初: 做T批量rebase(只上调) 新批量=int(总值×0.5×w×0.49/现价/100)×100; 核对闸门状态')
-    body = '\n'.join(lines)
-    title = ('🔄调仓日! ' if nxt_tday in (1, 11) else '') + f'合体v5.1 {nxt} 操盘单'
+        parts.append('🗓月初rebase')
+    summary = f'**总结**: {nxt} (第{nxt_tday}交易日) — ' + '; '.join(parts)
+
+    md = [summary, '', '## 一、轮动腿', '']
+    if rot_head:
+        md.append(f'1. {rot_head}')
+        md += [f'   - {s_}' for s_ in rot_steps]
+    else:
+        eta = f'约{11 - nxt_tday}个交易日后(第11交易日)' if nxt_tday < 11 else '下月第1个交易日'
+        md.append(f'1. 明天不是调仓日, 无动作; 下次调仓: {eta}')
+    md.append(f'2. {prem_line}')
+    md += ['3. 持仓与动量:', '',
+           '| 仓位 | 应持有 | 自何时 |', '| --- | --- | --- |']
+    for i in (0, 1):
+        md.append(f'| 第{i + 1}份 | {NAME.get(hold[i], "?")} | {last_reb[i]} |')
+    md += ['', '| 排名 | 标的 | 15日动量 |', '| --- | --- | --- |']
+    for i, s_ in enumerate(rank):
+        note = ' ⚠️溢价触闸' if (s_ == 'sh513100' and prem_block) else ''
+        md.append(f'| {i + 1} | {NAME[s_]}{note} | {sc[s_]:+.1%} |')
+    md += ['', '## 二、做T腿(每天固定)', '',
+           '| 标的 | 数量 | 9:15买 | 14:58卖 | 闸门 |', '| --- | --- | --- | --- | --- |']
+    gate_map = {c[2:]: (m, a) for c, m, a in gate}
+    for name_, lot in LOTS.items():
+        m_, a_ = gate_map.get(name_.split(' ')[0], (0.0, True))
+        st = '✅开' if a_ else '⛔停(只留底仓)'
+        md.append(f'| {name_} | {lot}股 | 涨停价 | 跌停价 | {st} {m_:+.1f}bp |')
+    md += ['', '## 三、日历', '']
+    cal = []
+    if is_dca:
+        cal.append('💰 明天周三: 转入定投 **1000 元**')
+    if nxt_tday == 1:
+        cal.append('🗓 明天月初: rebase做T批量(只上调), 新批量=int(总值×0.5×w×0.49÷现价÷100)×100')
+    if nxt_tday not in (1, 11):
+        cal.append(f'下个调仓日: 当月第11交易日(还差{11 - nxt_tday}个交易日)' if nxt_tday < 11
+                   else '下个调仓日: 下月第1个交易日')
+    md += [f'- {c_}' for c_ in (cal or ['无'])]
+    body = '\n'.join(md)
+    title = (('🔄调仓日 ' if nxt_tday in (1, 11) else '') + ('💰定投 ' if is_dca else '') +
+             f'合体v5.1 {nxt} 操盘单')
 
     key = os.environ.get('SERVERCHAN_KEY', '')
     if key:
