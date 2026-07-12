@@ -17,7 +17,7 @@
    Settings → Pages → Source 选 `Deploy from a branch`,分支 `main`、目录 `/docs`。
    之后随时打开 `https://1iamm.github.io/joint-quant-reminder/`。
 
-此后每周日~周四晚 20:37(北京时间)自动推送次日操盘单,并同步更新监控页。
+此后每周日~周四晚 18:37(北京时间)自动推送次日操盘单,并同步更新监控页。
 
 ## 消息内容
 

@@ -1,8 +1,8 @@
 name: heti-reminder
 on:
   schedule:
-    # 北京时间周日~周四晚 20:37 (UTC 12:37), 提醒下一交易日的操作
-    - cron: '37 12 * * 0,1,2,3,4'
+    # 北京时间周日~周四晚 18:37 (UTC 10:37), 提醒下一交易日的操作
+    - cron: '37 10 * * 0,1,2,3,4'
   workflow_dispatch: {}   # 手动触发入口, 用于测试
 
 permissions:
