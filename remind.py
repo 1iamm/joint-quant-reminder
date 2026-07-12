@@ -21,6 +21,8 @@ STRATS = [
      'live_since': '2026-07-10',   # 实盘建仓日(周五): 当天只买底仓不卖, 次日起每日做T循环
      'capital': 20000,             # 初始入金(2026-07-10 早间转入)
      'dca': 1000,                  # 每周三定投
+     'reserve': 5000,              # 2026-07-12追加, 纯流动性缓冲(国债整手/做T冻结资金不卡壳);
+                                    # 不计入rebase总值, 不推高轮动目标仓位, 只在凑整手缺口时垫用
      'tleg': [('sh512800', '512800 银行ETF', 3200),      # 2万口径
               ('sh563300', '563300 中证2000ETF', 1600)]},
     {'key': 'v6', 'name': 'v6 银行+中证1000 做T', 'primary': False,
@@ -287,15 +289,18 @@ def main():
     else:
         md += tleg_table(p0)
         cash_now = sim['cash'] if sim and sim['started'] else 0
-        md += ['', '**账户预演(估算价=最新收盘, 现金不含做T盈亏/利息)**', '',
+        reserve = p0.get('reserve', 0)
+        cash_disp = cash_now + reserve
+        note = f'(含备用金{reserve:.0f}元)' if reserve else ''
+        md += ['', f'**账户预演(估算价=最新收盘, 现金不含做T盈亏/利息){note}**', '',
                '| 时点 | 持仓 | 现金(约) |', '| --- | --- | --- |',
-               f'| 开盘前 | {pos_str()} | ≈{cash_now:.0f}元 |',
-               f'| 日内(9:15批次买入后) | {pos_str(with_double=True)} | ≈{cash_now - batch_cost:.0f}元(9:15挂单需可用≥{batch_cost * 1.1:.0f}) |',
-               f'| 收盘(14:58批次卖出后) | {pos_str()} | ≈{cash_now:.0f}元 ± 当日做T盈亏 |']
+               f'| 开盘前 | {pos_str()} | ≈{cash_disp:.0f}元 |',
+               f'| 日内(9:15批次买入后) | {pos_str(with_double=True)} | ≈{cash_disp - batch_cost:.0f}元(9:15挂单需可用≥{batch_cost * 1.1:.0f}) |',
+               f'| 收盘(14:58批次卖出后) | {pos_str()} | ≈{cash_disp:.0f}元 ± 当日做T盈亏 |']
         if is_dca:
-            md.append(f'| 定投到账后 | 不变 | ≈{cash_now + p0.get("dca", 0):.0f}元 |')
-        if cash_now < batch_cost * 1.1:
-            md += ['', f'⚠️ **资金偏紧**: 可用≈{cash_now:.0f} < 冻结需求≈{batch_cost * 1.1:.0f}, 明早买单请每只各减100股。']
+            md.append(f'| 定投到账后 | 不变 | ≈{cash_disp + p0.get("dca", 0):.0f}元 |')
+        if cash_disp < batch_cost * 1.1:
+            md += ['', f'⚠️ **资金偏紧**: 可用≈{cash_disp:.0f} < 冻结需求≈{batch_cost * 1.1:.0f}, 明早买单请每只各减100股。']
         # 调仓日: 按实盘账本给出真实动作(冷启动/买不起整手都考虑在内)
         if nxt_tday in (1, 11) and sim and sim['started']:
             leg = 0 if nxt_tday == 1 else 1
@@ -308,8 +313,9 @@ def main():
                 base_v = sum(lot * tpx[c] for c, _, lot in p0['tleg'])
                 oth = 1 - leg
                 oth_v = sim['tr_qty'][oth] * closes[sim['tr_hold'][oth]][D] if sim['tr_hold'][oth] != 'CASH' else 0
-                cash_for = cash_now + (sim['tr_qty'][leg] * closes[cur_r][D] if cur_r != 'CASH' else 0)
-                total = cash_for + base_v + oth_v
+                held_v = sim['tr_qty'][leg] * closes[cur_r][D] if cur_r != 'CASH' else 0
+                total = cash_now + held_v + base_v + oth_v      # 目标仓位=总值×24.5%, 总值不含备用金(备用金不推高目标)
+                cash_for = cash_now + reserve + held_v          # 可动用资金含备用金, 仅用于凑够整手缺口
                 qty = int(min(0.245 * total, cash_for) / closes[best_r][D] / 100) * 100
             else:
                 qty = 0
@@ -350,7 +356,8 @@ def main():
     if is_dca:
         cal.append('💰 明天周三: 转入定投 **1000 元**')
     if nxt_tday == 1:
-        cal.append('🗓 明天月初: rebase做T批量(只上调), 新批量=int(总值×0.5×w×0.49÷现价÷100)×100')
+        rnote = f'(总值不含备用金{p0.get("reserve", 0):.0f}元)' if p0.get('reserve') else ''
+        cal.append(f'🗓 明天月初: rebase做T批量(只上调), 新批量=int(总值×0.5×w×0.49÷现价÷100)×100{rnote}')
     if nxt_tday not in (1, 11):
         cal.append(f'下个调仓日: 当月第11交易日(还差{11 - nxt_tday}个交易日)' if nxt_tday < 11
                    else '下个调仓日: 下月第1个交易日')
