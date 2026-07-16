@@ -24,6 +24,7 @@ STRATS = [
      'cash_in': [('2026-07-15', 10000),
                  ('2026-07-16', 10000)],            # 追加入金 → 共4万
      'dca': 1000,                                   # 每周三定投
+     'dca_since': '2026-07-22',                     # 7-15未转定投, 从下周三起计
      'base_init': {'sh512800': 3200, 'sh563300': 1600},   # 7-10 实际建仓(2万口径)
      'base_topup': '2026-07-17',                    # 底仓扩容日: 早买新批量、尾卖旧批量
      'manual': [('2026-07-16', 'sh511010', 100)],   # 手动一手国债(两份轮动合持)
@@ -138,7 +139,8 @@ def simulate_live(p0, opens, closes, dates, decisions):
                 cash -= lot * opens[c][d]
         started = True
         cash += cash_in.get(d, 0)
-        if d != live and datetime.date.fromisoformat(d).weekday() == 2:
+        if (d != live and datetime.date.fromisoformat(d).weekday() == 2
+                and d >= p0.get('dca_since', live)):
             cash += p0.get('dca', 0)
         if topup and d == topup:
             for c, lot in lots_new.items():
