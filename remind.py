@@ -2,12 +2,13 @@
 """合体策略族 每日操盘提醒 — 零依赖(纯标准库), GitHub Actions / 本地 cron 每晚运行.
 
 覆盖三策略(轮动腿三者完全一致: 纳指/黄金/国债/现金, L15动量, 每月第1/11交易日双份错开, 纳指溢价>8%剔除):
-  ⭐ v6b: 做T腿 = 银行512800×0.5 + 中证2000 563300×0.5   ← 用户实盘(银河证券)
+  ⭐ v6b: 做T腿 = 银行512800×0.5 + 中证2000 563300×0.5   ← 用户实盘(银河证券, 4万)
      v6 : 做T腿 = 银行512800×0.5 + 中证1000 512100×0.5
      v5.1: 做T腿 = 中证500 510500×0.5 + 银行×0.3 + 2000×0.2
 做T闸门: 250日隔夜均值<-2bp(逐标的, 月度更新), 三策略共用同一标的状态.
-实盘账户预演: 从 live_since 起按协议重放(建仓/每周三定投/轮动含整手买不起退现金),
-估算"操作前/操作后"的持仓与现金(估值按最新收盘价, 不含做T日内盈亏与利息).
+实盘账本(v6b): 从 live_since 起按实际事件重放 — 建仓/追加入金/每周三定投/底仓扩容日/
+手动一手国债(两份轮动合持: 任一份信号离开国债时整手卖出, 另一份因买不起半手退现金)/
+轮动调仓(整手买不起自动留现金). 估值按最新收盘价, 不含做T日内盈亏与利息.
 有 SERVERCHAN_KEY 环境变量则推微信(Server酱, desp为Markdown), 否则打印.
 口径与 JQ 各策略终版代码一致; 参数冻结, 勿改.
 """
@@ -18,13 +19,16 @@ from zoneinfo import ZoneInfo
 # 批量=int(资金×0.5×w×0.49/现价/100)×100; 月初rebase只上调。
 STRATS = [
     {'key': 'v6b', 'name': 'v6b 银行+中证2000 做T', 'primary': True,
-     'live_since': '2026-07-10',   # 实盘建仓日(周五): 当天只买底仓不卖, 次日起每日做T循环
-     'capital': 20000,             # 初始入金(2026-07-10 早间转入)
-     'dca': 1000,                  # 每周三定投
-     'reserve': 5000,              # 2026-07-12追加, 纯流动性缓冲(国债整手/做T冻结资金不卡壳);
-                                    # 不计入rebase总值, 不推高轮动目标仓位, 只在凑整手缺口时垫用
-     'tleg': [('sh512800', '512800 银行ETF', 3200),      # 2万口径
-              ('sh563300', '563300 中证2000ETF', 1600)]},
+     'live_since': '2026-07-10',                    # 实盘建仓日(2万)
+     'capital': 20000,
+     'cash_in': [('2026-07-15', 10000),
+                 ('2026-07-16', 10000)],            # 追加入金 → 共4万
+     'dca': 1000,                                   # 每周三定投
+     'base_init': {'sh512800': 3200, 'sh563300': 1600},   # 7-10 实际建仓(2万口径)
+     'base_topup': '2026-07-17',                    # 底仓扩容日: 早买新批量、尾卖旧批量
+     'manual': [('2026-07-16', 'sh511010', 100)],   # 手动一手国债(两份轮动合持)
+     'tleg': [('sh512800', '512800 银行ETF', 6400),        # 4万口径批量(0.782价)
+              ('sh563300', '563300 中证2000ETF', 3500)]},  # (1.413价)
     {'key': 'v6', 'name': 'v6 银行+中证1000 做T', 'primary': False,
      'tleg': [('sh512800', '512800 银行ETF', 1600),
               ('sh512100', '512100 中证1000ETF', 300)]},
@@ -60,7 +64,6 @@ def fetch_qfq(code, n=640):
     return [(r[0], float(r[1]), float(r[2])) for r in rows if r[0] != drop]
 
 def fetch_raw_price(code):
-    """腾讯实时行情取未复权最新价(收盘后=当日收盘价), 失败返回None"""
     try:
         out = http_get(f'https://qt.gtimg.cn/q={code}')
         p = float(out.split('~')[3])
@@ -69,7 +72,6 @@ def fetch_raw_price(code):
         return None
 
 def fetch_nav_513100():
-    """新浪基金接口取513100最新单位净值 -> (date, nav) 或 None"""
     try:
         out = http_get('https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/'
                        'CaihuiFundInfoService.getNav?symbol=513100&page=1',
@@ -107,39 +109,64 @@ def replay_rotation(closes, dates):
     return hold, last_reb, tday, decisions
 
 def simulate_live(p0, opens, closes, dates, decisions):
-    """实盘账本重放(估算): 返回 {started, cash, tr_hold[2], tr_qty[2]}; 无live_since返回None.
-    规则: live日开盘价买底仓; 此后每周三+定投; 调仓日按信号换仓, 单份预算=24.5%×总值,
-    整手(100股)买不起(如国债一手1.4万)自动留现金 — 与策略代码的取整行为一致."""
+    """实盘账本重放(估算). 返回 {started, cash, tr_hold[2], tr_qty[2], joint_bond, base}"""
     live = p0.get('live_since')
     if not live:
         return None
     cash = float(p0.get('capital', 0))
     tr_hold = ['CASH', 'CASH']
     tr_qty = [0, 0]
+    joint_bond = False
     started = False
     dec = {}
     for d, leg, tgt in decisions:
         dec.setdefault(d, []).append((leg, tgt))
-    base_lots = {c: lot for c, _, lot in p0['tleg']}
+    lots_new = {c: lot for c, _, lot in p0['tleg']}
+    base = dict(p0.get('base_init') or lots_new)
+    topup = p0.get('base_topup', '')
+    cash_in = {}
+    for d, amt in p0.get('cash_in', []):
+        cash_in[d] = cash_in.get(d, 0) + amt
+    manual = {}
+    for d, code, qty in p0.get('manual', []):
+        manual.setdefault(d, []).append((code, qty))
     for d in dates:
         if d < live:
             continue
-        if not started and d == live:
-            for c, lot in base_lots.items():
+        if not started:
+            for c, lot in base.items():
                 cash -= lot * opens[c][d]
         started = True
+        cash += cash_in.get(d, 0)
         if d != live and datetime.date.fromisoformat(d).weekday() == 2:
             cash += p0.get('dca', 0)
+        if topup and d == topup:
+            for c, lot in lots_new.items():
+                add = lot - base.get(c, 0)
+                if add > 0:
+                    cash -= add * opens[c][d]
+            base = dict(lots_new)
+        for code, qty in manual.get(d, []):
+            cash -= qty * closes[code][d]
+            if code == 'sh511010':
+                tr_hold = ['sh511010', 'sh511010']
+                tr_qty = [qty // 2, qty - qty // 2]
+                joint_bond = True
         for leg, tgt in dec.get(d, []):
             cur = tr_hold[leg]
             if tgt == cur:
                 continue
-            if cur != 'CASH':
+            if cur == 'sh511010' and joint_bond:
+                cash += (tr_qty[0] + tr_qty[1]) * opens[cur][d]   # 整手卖出, 合持解除
+                tr_hold = ['CASH', 'CASH']
+                tr_qty = [0, 0]
+                joint_bond = False
+            elif cur != 'CASH':
                 cash += tr_qty[leg] * opens[cur][d]
                 tr_qty[leg] = 0
                 tr_hold[leg] = 'CASH'
             if tgt != 'CASH':
-                base_v = sum(lot * closes[c][d] for c, lot in base_lots.items())
+                base_v = sum(lot * closes[c][d] for c, lot in base.items())
                 oth = 1 - leg
                 oth_v = tr_qty[oth] * closes[tr_hold[oth]][d] if tr_hold[oth] != 'CASH' else 0
                 total = cash + base_v + oth_v
@@ -148,7 +175,8 @@ def simulate_live(p0, opens, closes, dates, decisions):
                     cash -= qty * opens[tgt][d]
                     tr_hold[leg] = tgt
                     tr_qty[leg] = qty
-    return {'started': started, 'cash': cash, 'tr_hold': tr_hold, 'tr_qty': tr_qty}
+    return {'started': started, 'cash': cash, 'tr_hold': tr_hold, 'tr_qty': tr_qty,
+            'joint_bond': joint_bond, 'base': base}
 
 def next_weekday(day):
     d = day + datetime.timedelta(days=1)
@@ -167,12 +195,10 @@ def main():
     D = rdates[-1]
     nxt_tday = 1 if nxt.month != int(D[5:7]) else tday[D] + 1
 
-    # 最新动量榜
     sc = {s: closes[s][rdates[-1]] / closes[s][rdates[-L]] - 1 for s in ROT}
     sc['CASH'] = CASH_SCORE
     rank = sorted(sc, key=sc.get, reverse=True)
 
-    # 溢价
     nav = fetch_nav_513100()
     px = fetch_raw_price('sh513100') or closes['sh513100'][D]
     prem_block = False
@@ -186,7 +212,6 @@ def main():
     else:
         prem_line = '纳指溢价: 接口未取到, 若调仓涉及纳指请在App核对IOPV溢价<8%'
 
-    # 做T标的行情与闸门(逐标的, 三策略共用)
     gate, tpx = {}, {}
     for code in TLEG:
         rows = fetch_qfq(code, 300)
@@ -196,15 +221,15 @@ def main():
         opens[code] = {d: o for d, o, _ in rows}
         closes[code] = {d: cl for d, _, cl in rows}
         tpx[code] = rows[-1][2]
+    tpx['sh511010'] = closes['sh511010'][D]
 
-    # 实盘账本(主策略)
     p0 = STRATS[0]
     sim = simulate_live(p0, opens, closes, rdates, decisions)
     live = p0.get('live_since', '')
+    topup = p0.get('base_topup', '')
     is_live_day = live == str(nxt)
+    is_topup_day = topup == str(nxt)
     pre_live = (not is_live_day) and (sim is not None and not sim['started']) and live > str(today)
-
-    # ---- 组装消息(Markdown; 表格前后需空行) ----
     is_dca = nxt.weekday() == 2
 
     # 轮动动作判定(三策略同信号, 稳态口径)
@@ -231,9 +256,11 @@ def main():
     off0 = [n.split(' ')[0] for c, n, _ in p0['tleg'] if not gate[c][1]]
     parts = [rot_head if rot_head else '轮动无动作(三策略同)']
     if pre_live:
-        parts.append(f'⭐{p0["key"]}**未开跑, 明天仅入金{p0.get("capital", 0)}元**({live} 周一建仓)')
+        parts.append(f'⭐{p0["key"]}未开跑({live}建仓)')
     elif is_live_day:
-        parts.append(f'⭐{p0["key"]} **实盘建仓日: 只买底仓{len(p0["tleg"])}张单, 今天不卖**')
+        parts.append(f'⭐{p0["key"]} **实盘建仓日: 只买底仓, 今天不卖**')
+    elif is_topup_day:
+        parts.append('⭐v6b **底仓扩容日: 早买新批量/尾卖旧批量**')
     else:
         parts.append(f'⭐{p0["key"]}做T{len(p0["tleg"]) * 2}张单照常' + (f'(⛔{"/".join(off0)}暂停)' if off0 else ''))
     if is_dca:
@@ -250,58 +277,60 @@ def main():
             rows.append(f'| {name_} | {lot}股 | 涨停价 | 跌停价 | {st} {m:+.1f}bp |')
         return rows
 
-    def pos_str(with_double=False):
-        """实盘持仓描述(估值=最新收盘)"""
+    def pos_str(intraday=False):
+        """实盘持仓描述(估值=最新收盘). intraday=早盘批次买入后"""
         items = []
         for c, name_, lot in p0['tleg']:
-            n = lot * 2 if with_double else lot
-            items.append(f'{name_.split(" ")[1]}{n}股(≈{n * tpx[c]:.0f}元)')
-        for i in (0, 1):
-            if sim['tr_hold'][i] != 'CASH':
-                c = sim['tr_hold'][i]
-                q = sim['tr_qty'][i]
-                items.append(f'{SHORT[c]}{q}股(≈{q * closes[c][D]:.0f}元)')
+            q = sim['base'].get(c, 0) + (lot if intraday else 0)
+            items.append(f'{name_.split(" ")[1]}{q}股(≈{q * tpx[c]:.0f}元)')
+        if sim['joint_bond']:
+            q = sim['tr_qty'][0] + sim['tr_qty'][1]
+            items.append(f'国债ETF{q}股·两份合持(≈{q * tpx["sh511010"]:.0f}元)')
+        else:
+            for i in (0, 1):
+                if sim['tr_hold'][i] != 'CASH':
+                    c = sim['tr_hold'][i]
+                    q = sim['tr_qty'][i]
+                    items.append(f'{SHORT[c]}{q}股(≈{q * closes[c][D]:.0f}元)')
         return ' + '.join(items) if items else '无'
 
-    md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略)', '']
+    md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略, 4万)', '']
     batch_cost = sum(lot * tpx[c] for c, _, lot in p0['tleg'])
+    cash_now = sim['cash'] if sim and sim['started'] else 0
     if pre_live:
-        md += [f'**准备期**: 明天({nxt})只做一件事——**入金 {p0.get("capital", 0)} 元**, 不下任何单。',
-               f'建仓日为 **{live}(周一)**, 周日晚推送会给建仓条件单明细。', '',
-               '**账户预演**', '',
-               '| 时点 | 持仓 | 现金(约) |', '| --- | --- | --- |',
-               f'| 明天入金后 | 无 | {p0.get("capital", 0)}元 |',
-               f'| {live}建仓后 | 底仓≈{batch_cost:.0f}元 | ≈{p0.get("capital", 0) - batch_cost:.0f}元 |']
+        md += [f'**准备期**: {live} 建仓, 无操作。']
     elif is_live_day:
-        md += ['**今天是实盘建仓日**: 只买入底仓, **不设卖单**; 每日做T循环(9:15买批次+14:58卖批次)从下一交易日开始。', '',
-               '| 标的 | 底仓数量 | 委托 |', '| --- | --- | --- |']
+        md += ['**实盘建仓日**: 只买入底仓, 不设卖单。', '']
+        md += ['| 标的 | 底仓数量 | 委托 |', '| --- | --- | --- |']
         for code, name_, lot in p0['tleg']:
-            md.append(f'| {name_} | **{lot}股** | 定时条件单 9:15 @涨停价(集合竞价按开盘价成交) |')
-        cap = p0.get('capital', 0)
-        md += ['', '**账户预演**', '',
+            md.append(f'| {name_} | **{lot}股** | 9:15 @涨停价 |')
+    elif is_topup_day:
+        old = sim['base']
+        md += ['**明天是底仓扩容日**(资金已升至4万): 早上按**新批量**买入, 尾盘按**旧批量**卖出,'
+               ' 收盘后底仓自动升级; 后天起每日买卖均为新批量。', '',
+               '| 标的 | 9:15买(新批量) | 14:58卖(旧批量) | 闸门 |', '| --- | --- | --- | --- |']
+        for code, name_, lot in p0['tleg']:
+            m, a = gate[code]
+            st = '✅' if a else '⛔停做T,今日只卖旧批'
+            md.append(f'| {name_} | **{lot}股**@涨停价 | **{old.get(code, 0)}股**@跌停价 | {st} {m:+.1f}bp |')
+        buy_cost = batch_cost
+        end_cash = cash_now - sum((lot - old.get(c, 0)) * tpx[c] for c, _, lot in p0['tleg'])
+        md += ['', '**账户预演(估算价=最新收盘)**', '',
                '| 时点 | 持仓 | 现金(约) |', '| --- | --- | --- |',
-               f'| 开盘前 | 无 | {cap}元 |',
-               f'| 9:15买单成交后 | {" + ".join(f"{n.split(chr(32))[1]}{lot}股(≈{lot * tpx[c]:.0f}元)" for c, n, lot in p0["tleg"])} | ≈{cap - batch_cost:.0f}元 |',
-               '',
-               f'- ⚠️ **先确认 {cap} 元已到账**; 若银证转账未成, 周一 8:30-9:10 转入后再等 9:15 触发',
-               f'- 挂单瞬间按涨停价冻结≈{batch_cost * 1.1:.0f}元, 成交后差额退回',
-               '- 其余资金留现金(轮动份额等调仓日信号, 勿抢跑), 收盘前可做**通用回购/逆回购**']
+               f'| 开盘前 | {pos_str()} | ≈{cash_now:.0f}元 |',
+               f'| 日内(9:15买入后) | {pos_str(intraday=True)} | ≈{cash_now - buy_cost:.0f}元(挂单需可用≥{buy_cost * 1.1:.0f}) |',
+               f'| 收盘(卖旧批后) | 底仓升级为新批量+国债 | ≈{end_cash:.0f}元 ± 当日做T盈亏 |']
     else:
         md += tleg_table(p0)
-        cash_now = sim['cash'] if sim and sim['started'] else 0
-        reserve = p0.get('reserve', 0)
-        cash_disp = cash_now + reserve
-        note = f'(含备用金{reserve:.0f}元)' if reserve else ''
-        md += ['', f'**账户预演(估算价=最新收盘, 现金不含做T盈亏/利息){note}**', '',
+        md += ['', '**账户预演(估算价=最新收盘, 现金不含做T盈亏/利息)**', '',
                '| 时点 | 持仓 | 现金(约) |', '| --- | --- | --- |',
-               f'| 开盘前 | {pos_str()} | ≈{cash_disp:.0f}元 |',
-               f'| 日内(9:15批次买入后) | {pos_str(with_double=True)} | ≈{cash_disp - batch_cost:.0f}元(9:15挂单需可用≥{batch_cost * 1.1:.0f}) |',
-               f'| 收盘(14:58批次卖出后) | {pos_str()} | ≈{cash_disp:.0f}元 ± 当日做T盈亏 |']
+               f'| 开盘前 | {pos_str()} | ≈{cash_now:.0f}元 |',
+               f'| 日内(9:15批次买入后) | {pos_str(intraday=True)} | ≈{cash_now - batch_cost:.0f}元(9:15挂单需可用≥{batch_cost * 1.1:.0f}) |',
+               f'| 收盘(14:58批次卖出后) | {pos_str()} | ≈{cash_now:.0f}元 ± 当日做T盈亏 |']
         if is_dca:
-            md.append(f'| 定投到账后 | 不变 | ≈{cash_disp + p0.get("dca", 0):.0f}元 |')
-        if cash_disp < batch_cost * 1.1:
-            md += ['', f'⚠️ **资金偏紧**: 可用≈{cash_disp:.0f} < 冻结需求≈{batch_cost * 1.1:.0f}, 明早买单请每只各减100股。']
-        # 调仓日: 按实盘账本给出真实动作(冷启动/买不起整手都考虑在内)
+            md.append(f'| 定投到账后 | 不变 | ≈{cash_now + p0.get("dca", 0):.0f}元 |')
+        if cash_now < batch_cost * 1.1:
+            md += ['', f'⚠️ **资金偏紧**: 可用≈{cash_now:.0f} < 冻结需求≈{batch_cost * 1.1:.0f}, 明早买单请每只各减100股。']
         if nxt_tday in (1, 11) and sim and sim['started']:
             leg = 0 if nxt_tday == 1 else 1
             cur_r = sim['tr_hold'][leg]
@@ -309,26 +338,25 @@ def main():
             if prem_block and 'sh513100' in sc2:
                 del sc2['sh513100']
             best_r = max(sc2, key=sc2.get)
-            if best_r != 'CASH':
-                base_v = sum(lot * tpx[c] for c, _, lot in p0['tleg'])
-                oth = 1 - leg
-                oth_v = sim['tr_qty'][oth] * closes[sim['tr_hold'][oth]][D] if sim['tr_hold'][oth] != 'CASH' else 0
-                held_v = sim['tr_qty'][leg] * closes[cur_r][D] if cur_r != 'CASH' else 0
-                total = cash_now + held_v + base_v + oth_v      # 目标仓位=总值×24.5%, 总值不含备用金(备用金不推高目标)
-                cash_for = cash_now + reserve + held_v          # 可动用资金含备用金, 仅用于凑够整手缺口
-                qty = int(min(0.245 * total, cash_for) / closes[best_r][D] / 100) * 100
-            else:
-                qty = 0
             if best_r == cur_r:
                 md += ['', f'🔄 明天调仓日: 第{leg + 1}份实盘持仓已是 {SHORT[cur_r]}, **不动**。']
-            elif best_r != 'CASH' and qty == 0:
-                md += ['', f'🔄 明天调仓日: 信号={SHORT[best_r]}, 但单份预算买不起一手(整手取整=0), **留现金不动**(与策略取整规则一致)。']
-            else:
-                md += ['', f'🔄 明天调仓日: 第{leg + 1}份实盘动作 **{SHORT.get(cur_r, "现金")} → {SHORT[best_r]}**:']
-                if cur_r != 'CASH':
-                    md.append(f'   - 9:15 卖出 {NAME[cur_r]} {sim["tr_qty"][leg]}股 @跌停价')
+            elif cur_r == 'sh511010' and sim['joint_bond']:
+                qj = sim['tr_qty'][0] + sim['tr_qty'][1]
+                md += ['', f'🔄 明天调仓日: 第{leg + 1}份信号离开国债 → **卖出国债ETF整手{qj}股** 9:15@跌停价(两份合持解除):']
                 if best_r != 'CASH':
-                    md.append(f'   - 9:31 买入 {NAME[best_r]} **{qty}股**(≈{qty * closes[best_r][D]:.0f}元) @五档价')
+                    md.append(f'   - 第{leg + 1}份 9:31 买入 {NAME[best_r]}, 数量=约24.5%总值÷现价 取整百')
+                md.append('   - 另一份: 单份买不起整手国债, **留现金**(做逆回购)')
+            else:
+                bud = 0.245 * (cash_now + sum(l * tpx[c] for c, _, l in p0['tleg']))
+                qty = int(min(bud, cash_now) / closes[best_r][D] / 100) * 100 if best_r != 'CASH' else 0
+                if best_r != 'CASH' and qty == 0:
+                    md += ['', f'🔄 明天调仓日: 信号={SHORT[best_r]}, 但单份预算买不起整手, **留现金不动**。']
+                else:
+                    md += ['', f'🔄 明天调仓日: 第{leg + 1}份实盘动作 **{SHORT.get(cur_r, "现金")} → {SHORT[best_r]}**:']
+                    if cur_r != 'CASH':
+                        md.append(f'   - 9:15 卖出 {NAME[cur_r]} {sim["tr_qty"][leg]}股 @跌停价')
+                    if best_r != 'CASH':
+                        md.append(f'   - 9:31 买入 {NAME[best_r]} **{qty}股**(≈{qty * closes[best_r][D]:.0f}元) @五档价')
     md += ['', '## 二、轮动腿(三策略共用同一信号)', '']
     if rot_head:
         md.append(f'1. {rot_head}')
@@ -364,7 +392,7 @@ def main():
     md += [f'- {c_}' for c_ in (cal or ['无'])]
     body = '\n'.join(md)
     title = (('🔄调仓日 ' if nxt_tday in (1, 11) else '') + ('💰定投 ' if is_dca else '') +
-             f'合体三策略 {nxt} 操盘单')
+             ('🧱扩容日 ' if is_topup_day else '') + f'合体三策略 {nxt} 操盘单')
 
     key = os.environ.get('SERVERCHAN_KEY', '')
     if key:
