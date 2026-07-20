@@ -27,7 +27,7 @@ STRATS = [
      'dca_since': '2026-07-22',                     # 7-15未转定投, 从下周三起计
      'base_init': {'sh512800': 3200, 'sh563300': 1600},   # 7-10 实际建仓(2万口径)
      'base_topup': '2026-07-17',                    # 底仓扩容日: 早买新批量、尾卖旧批量
-     'manual': [('2026-07-16', 'sh511010', 100)],   # 手动一手国债(两份轮动合持)
+     'manual': [('2026-07-16', 'sh511010', 100, 140.805)],   # 手动一手国债(两份轮动合持)
      'tw': {'sh512800': 0.5, 'sh563300': 0.5},      # 做T腿内权重(rebase计算用)
      'tleg': [('sh512800', '512800 银行ETF', 6400),        # 4万口径批量(0.782价)
               ('sh563300', '563300 中证2000ETF', 3500)]},  # (1.413价)
@@ -111,62 +111,87 @@ def replay_rotation(closes, dates):
     return hold, last_reb, tday, decisions
 
 def simulate_live(p0, opens, closes, dates, decisions):
-    """实盘账本重放(估算). 返回 {started, cash, tr_hold[2], tr_qty[2], joint_bond, base}"""
+    """实盘账本重放(估算). 返回 {started, cash, tr_hold, tr_qty, tr_cost, joint_bond,
+    base, base_cost, bond_cost, t_pnl, vals[(日,总值,累计投入)]}
+    总值 = 现金 + 持仓市值 + 做T累计盈亏(按协议每天执行的估算); 不含利息."""
     live = p0.get('live_since')
     if not live:
         return None
     cash = float(p0.get('capital', 0))
+    invested = float(p0.get('capital', 0))
     tr_hold = ['CASH', 'CASH']
     tr_qty = [0, 0]
+    tr_cost = [0.0, 0.0]
     joint_bond = False
+    bond_cost = 0.0
     started = False
+    t_pnl = 0.0
+    vals = []
     dec = {}
     for d, leg, tgt in decisions:
         dec.setdefault(d, []).append((leg, tgt))
     lots_new = {c: lot for c, _, lot in p0['tleg']}
     base = dict(p0.get('base_init') or lots_new)
+    base_cost = {c: 0.0 for c in base}
     topup = p0.get('base_topup', '')
     cash_in = {}
     for d, amt in p0.get('cash_in', []):
         cash_in[d] = cash_in.get(d, 0) + amt
     manual = {}
-    for d, code, qty in p0.get('manual', []):
-        manual.setdefault(d, []).append((code, qty))
+    for m in p0.get('manual', []):
+        manual.setdefault(m[0], []).append((m[1], m[2], m[3] if len(m) > 3 else None))
     for d in dates:
         if d < live:
             continue
+        mb = dict(base)   # 早盘时点的底仓(=当日做T批量)
         if not started:
             for c, lot in base.items():
                 cash -= lot * opens[c][d]
+                base_cost[c] += lot * opens[c][d]
+        else:
+            # 做T批次盈亏(协议口径: 每天开盘买批次/收盘卖批次)
+            day_p = 0.0
+            for c, q in mb.items():
+                day_p += q * (closes[c][d] - opens[c][d])
+                day_p -= 2 * max(0.1, q * opens[c][d] * 5e-5)
+            t_pnl += day_p
         started = True
         cash += cash_in.get(d, 0)
+        invested += cash_in.get(d, 0)
         if (d != live and datetime.date.fromisoformat(d).weekday() == 2
                 and d >= p0.get('dca_since', live)):
             cash += p0.get('dca', 0)
+            invested += p0.get('dca', 0)
         if topup and d == topup:
             for c, lot in lots_new.items():
                 add = lot - base.get(c, 0)
                 if add > 0:
                     cash -= add * opens[c][d]
+                    base_cost[c] = base_cost.get(c, 0) + add * opens[c][d]
             base = dict(lots_new)
-        for code, qty in manual.get(d, []):
-            cash -= qty * closes[code][d]
+        for code, qty, px in manual.get(d, []):
+            px = px if px else closes[code][d]
+            cash -= qty * px
             if code == 'sh511010':
                 tr_hold = ['sh511010', 'sh511010']
                 tr_qty = [qty // 2, qty - qty // 2]
+                tr_cost = [qty // 2 * px, (qty - qty // 2) * px]
+                bond_cost = px
                 joint_bond = True
         for leg, tgt in dec.get(d, []):
             cur = tr_hold[leg]
             if tgt == cur:
                 continue
             if cur == 'sh511010' and joint_bond:
-                cash += (tr_qty[0] + tr_qty[1]) * opens[cur][d]   # 整手卖出, 合持解除
+                cash += (tr_qty[0] + tr_qty[1]) * opens[cur][d]
                 tr_hold = ['CASH', 'CASH']
                 tr_qty = [0, 0]
+                tr_cost = [0.0, 0.0]
                 joint_bond = False
             elif cur != 'CASH':
                 cash += tr_qty[leg] * opens[cur][d]
                 tr_qty[leg] = 0
+                tr_cost[leg] = 0.0
                 tr_hold[leg] = 'CASH'
             if tgt != 'CASH':
                 base_v = sum(lot * closes[c][d] for c, lot in base.items())
@@ -178,8 +203,15 @@ def simulate_live(p0, opens, closes, dates, decisions):
                     cash -= qty * opens[tgt][d]
                     tr_hold[leg] = tgt
                     tr_qty[leg] = qty
+                    tr_cost[leg] = qty * opens[tgt][d]
+        pos_v = sum(q * closes[c][d] for c, q in base.items())
+        for i in (0, 1):
+            if tr_hold[i] != 'CASH':
+                pos_v += tr_qty[i] * closes[tr_hold[i]][d]
+        vals.append((d, cash + pos_v + t_pnl, invested))
     return {'started': started, 'cash': cash, 'tr_hold': tr_hold, 'tr_qty': tr_qty,
-            'joint_bond': joint_bond, 'base': base}
+            'tr_cost': tr_cost, 'joint_bond': joint_bond, 'base': base,
+            'base_cost': base_cost, 'bond_cost': bond_cost, 't_pnl': t_pnl, 'vals': vals}
 
 def next_weekday(day):
     d = day + datetime.timedelta(days=1)
@@ -300,6 +332,38 @@ def main():
         return ' + '.join(items) if items else '无'
 
     md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略, 4万)', '']
+    if sim and sim['started'] and sim['vals']:
+        d_, val, inv = sim['vals'][-1]
+        day_line = ''
+        if len(sim['vals']) >= 2:
+            pv, pinv = sim['vals'][-2][1], sim['vals'][-2][2]
+            dchg = val - pv - (inv - pinv)
+            day_line = f' · 当日({d_}) **{dchg:+.0f}元 ({dchg / pv:+.2%})**'
+        md += [f'**账户快照(估)**: 总值≈**{val:.0f}元** / 投入{inv:.0f}元 · '
+               f'累计 **{val - inv:+.0f}元 ({(val - inv) / inv:+.2%})**' + day_line, '',
+               '| 持仓 | 数量 | 成本(估) | 现价 | 市值 | 盈亏 |', '| --- | --- | --- | --- | --- | --- |']
+        for c, name_, lot in p0['tleg']:
+            q = sim['base'].get(c, 0)
+            avg = sim['base_cost'].get(c, 0) / q if q else 0
+            mv = q * tpx[c]
+            pnl = mv - sim['base_cost'].get(c, 0)
+            md.append(f'| {name_.split(" ")[1]} | {q} | {avg:.3f} | {tpx[c]:.3f} | {mv:.0f} | {pnl:+.0f} ({pnl / sim["base_cost"][c]:+.1%}) |')
+        if sim['joint_bond']:
+            q = sim['tr_qty'][0] + sim['tr_qty'][1]
+            cb = sim['bond_cost']
+            px_ = closes['sh511010'][D]
+            md.append(f'| 国债ETF(轮动合持) | {q} | {cb:.3f} | {px_:.3f} | {q * px_:.0f} | {q * (px_ - cb):+.0f} |')
+        else:
+            for i in (0, 1):
+                if sim['tr_hold'][i] != 'CASH':
+                    c = sim['tr_hold'][i]
+                    q = sim['tr_qty'][i]
+                    avg = sim['tr_cost'][i] / q if q else 0
+                    px_ = closes[c][D]
+                    md.append(f'| {SHORT[c]}(轮动{i + 1}) | {q} | {avg:.3f} | {px_:.3f} | {q * px_:.0f} | {q * px_ - sim["tr_cost"][i]:+.0f} |')
+        md.append(f'| 现金(含逆回购) | — | — | — | {sim["cash"]:.0f} | — |')
+        md.append(f'| 做T累计净贡献(协议口径) | — | — | — | {sim["t_pnl"]:+.0f} | — |')
+        md += ['', '📏 口径: 成本=建仓/扩容均价(不含做T摊薄), 不含利息; **App实际总资产−本表总值≈执行偏差**, 长期差>200元请发我校准。', '']
     batch_cost = sum(lot * tpx[c] for c, _, lot in p0['tleg'])
     cash_now = sim['cash'] if sim and sim['started'] else 0
     if pre_live:
