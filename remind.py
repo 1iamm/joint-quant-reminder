@@ -28,6 +28,7 @@ STRATS = [
      'base_init': {'sh512800': 3200, 'sh563300': 1600},   # 7-10 实际建仓(2万口径)
      'base_topup': '2026-07-17',                    # 底仓扩容日: 早买新批量、尾卖旧批量
      'manual': [('2026-07-16', 'sh511010', 100)],   # 手动一手国债(两份轮动合持)
+     'tw': {'sh512800': 0.5, 'sh563300': 0.5},      # 做T腿内权重(rebase计算用)
      'tleg': [('sh512800', '512800 银行ETF', 6400),        # 4万口径批量(0.782价)
               ('sh563300', '563300 中证2000ETF', 3500)]},  # (1.413价)
     {'key': 'v6', 'name': 'v6 银行+中证1000 做T', 'primary': False,
@@ -215,9 +216,11 @@ def main():
         prem_line = '纳指溢价: 接口未取到, 若调仓涉及纳指请在App核对IOPV溢价<8%'
 
     gate, tpx = {}, {}
+    # 闸门口径=策略的月初锁定: 用 nxt 所在月首日前的数据; 若明天是月初(重设闸门日)则用全量
+    g_cut = '9999' if nxt_tday == 1 else f'{nxt.year:04d}-{nxt.month:02d}-01'
     for code in TLEG:
-        rows = fetch_qfq(code, 300)
-        ov = [rows[i][1] / rows[i - 1][2] - 1 for i in range(1, len(rows))]
+        rows = fetch_qfq(code, 320)
+        ov = [rows[i][1] / rows[i - 1][2] - 1 for i in range(1, len(rows)) if rows[i][0] < g_cut]
         m = sum(ov[-250:]) / min(250, len(ov)) * 1e4
         gate[code] = (m, m < -2.0)
         opens[code] = {d: o for d, o, _ in rows}
