@@ -2,7 +2,7 @@
 """合体策略族 每日操盘提醒 — 零依赖(纯标准库), GitHub Actions / 本地 cron 每晚运行.
 
 覆盖三策略(轮动腿三者完全一致: 纳指/黄金/国债/现金, L15动量, 每月第1/11交易日双份错开, 纳指溢价>8%剔除):
-  ⭐ v6b: 做T腿 = 银行512800×0.5 + 中证2000 563300×0.5   ← 用户实盘(银河证券, 4万)
+  ⭐ v6b: 做T腿 = 银行512800×0.5 + 中证2000 563300×0.5   ← 用户实盘(银河证券, 5万)
      v6 : 做T腿 = 银行512800×0.5 + 中证1000 512100×0.5
      v5.1: 做T腿 = 中证500 510500×0.5 + 银行×0.3 + 2000×0.2
 做T闸门: 250日隔夜均值<-2bp(逐标的, 月度更新), 三策略共用同一标的状态.
@@ -22,17 +22,20 @@ STRATS = [
      'live_since': '2026-07-10',                    # 实盘建仓日(2万)
      'capital': 20000,
      'cash_in': [('2026-07-15', 10000),
-                 ('2026-07-16', 10000)],            # 追加入金 → 共4万
+                 ('2026-07-16', 10000),             # → 4万
+                 ('2026-07-23', 10000)],            # 追加入金 → 共5万
      'dca': 1000,                                   # 每周三定投
-     'dca_since': '2026-07-22',                     # 7-15未转定投, 从下周三起计
+     'dca_since': '2026-07-29',                     # 7-15/7-22定投均未转, 从7-29起计
      'base_init': {'sh512800': 3200, 'sh563300': 1600},   # 7-10 实际建仓(2万口径)
-     'base_topup': '2026-07-17',                    # 底仓扩容日: 早买新批量、尾卖旧批量
+     # 底仓扩容日(可多次): 早买新批量、尾卖旧批量
+     'base_topups': [('2026-07-17', {'sh512800': 6400, 'sh563300': 3500}),   # 4万扩容
+                     ('2026-07-24', {'sh512800': 7500, 'sh563300': 4600})],  # 5万扩容
      'manual': [('2026-07-16', 'sh511010', 100, 140.805)],   # 手动一手国债(两份轮动合持)
      'tw': {'sh512800': 0.5, 'sh563300': 0.5},      # 做T腿内权重(rebase计算用)
      # 基线校准 2026-07-20收盘: App实际总资产39225.55, 账本估39288, 偏差-62
      # (主因: 7-14漏做一天做T≈-52, 其余为费用/利息/口径小项) — 偏差漂移>200元需重新校准
-     'tleg': [('sh512800', '512800 银行ETF', 6400),        # 4万口径批量(0.782价)
-              ('sh563300', '563300 中证2000ETF', 3500)]},  # (1.413价)
+     'tleg': [('sh512800', '512800 银行ETF', 7500),        # 5万口径批量(0.800价)
+              ('sh563300', '563300 中证2000ETF', 4600)]},  # (1.293价)
     {'key': 'v6', 'name': 'v6 银行+中证1000 做T', 'primary': False,
      'tleg': [('sh512800', '512800 银行ETF', 1600),
               ('sh512100', '512100 中证1000ETF', 300)]},
@@ -135,7 +138,7 @@ def simulate_live(p0, opens, closes, dates, decisions):
     lots_new = {c: lot for c, _, lot in p0['tleg']}
     base = dict(p0.get('base_init') or lots_new)
     base_cost = {c: 0.0 for c in base}
-    topup = p0.get('base_topup', '')
+    topups = dict(p0.get('base_topups', []))
     cash_in = {}
     for d, amt in p0.get('cash_in', []):
         cash_in[d] = cash_in.get(d, 0) + amt
@@ -164,13 +167,13 @@ def simulate_live(p0, opens, closes, dates, decisions):
                 and d >= p0.get('dca_since', live)):
             cash += p0.get('dca', 0)
             invested += p0.get('dca', 0)
-        if topup and d == topup:
-            for c, lot in lots_new.items():
+        if d in topups:
+            for c, lot in topups[d].items():
                 add = lot - base.get(c, 0)
                 if add > 0:
                     cash -= add * opens[c][d]
                     base_cost[c] = base_cost.get(c, 0) + add * opens[c][d]
-            base = dict(lots_new)
+                base[c] = lot
         for code, qty, px in manual.get(d, []):
             px = px if px else closes[code][d]
             cash -= qty * px
@@ -265,9 +268,9 @@ def main():
     p0 = STRATS[0]
     sim = simulate_live(p0, opens, closes, rdates, decisions)
     live = p0.get('live_since', '')
-    topup = p0.get('base_topup', '')
+    topup_lots = dict(p0.get('base_topups', [])).get(str(nxt))
     is_live_day = live == str(nxt)
-    is_topup_day = topup == str(nxt)
+    is_topup_day = topup_lots is not None
     pre_live = (not is_live_day) and (sim is not None and not sim['started']) and live > str(today)
     is_dca = nxt.weekday() == 2
 
@@ -333,7 +336,7 @@ def main():
                     items.append(f'{SHORT[c]}{q}股(≈{q * closes[c][D]:.0f}元)')
         return ' + '.join(items) if items else '无'
 
-    md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略, 4万)', '']
+    md = [summary, '', f'## ⭐ 一、{p0["name"]}(你的实操策略, 5万)', '']
     if sim and sim['started'] and sim['vals']:
         d_, val, inv = sim['vals'][-1]
         day_line = ''
@@ -377,13 +380,13 @@ def main():
             md.append(f'| {name_} | **{lot}股** | 9:15 @涨停价 |')
     elif is_topup_day:
         old = sim['base']
-        md += ['**明天是底仓扩容日**(资金已升至4万): 早上按**新批量**买入, 尾盘按**旧批量**卖出,'
+        md += ['**明天是底仓扩容日**(资金已升至5万): 早上按**新批量**买入, 尾盘按**旧批量**卖出,'
                ' 收盘后底仓自动升级; 后天起每日买卖均为新批量。', '',
                '| 标的 | 9:15买(新批量) | 14:58卖(旧批量) | 闸门 |', '| --- | --- | --- | --- |']
         for code, name_, lot in p0['tleg']:
             m, a = gate[code]
             st = '✅' if a else '⛔停做T,今日只卖旧批'
-            md.append(f'| {name_} | **{lot}股**@涨停价 | **{old.get(code, 0)}股**@跌停价 | {st} {m:+.1f}bp |')
+            md.append(f'| {name_} | **{topup_lots.get(code, lot)}股**@涨停价 | **{old.get(code, 0)}股**@跌停价 | {st} {m:+.1f}bp |')
         buy_cost = batch_cost
         end_cash = cash_now - sum((lot - old.get(c, 0)) * tpx[c] for c, _, lot in p0['tleg'])
         md += ['', '**账户预演(估算价=最新收盘)**', '',
